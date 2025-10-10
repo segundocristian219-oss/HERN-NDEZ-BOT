@@ -1,5 +1,5 @@
 // plugins/checkTiempoGrupos.js
-const fs = require("fs");
+/*const fs = require("fs");
 const path = require("path");
 
 const handler = async (conn) => {
