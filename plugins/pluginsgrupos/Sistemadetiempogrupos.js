@@ -50,4 +50,4 @@ if (info?.abrir && ahora >= info.abrir) {
 };
 
 handler.run = handler;
-module.exports = handler;
+module.exports = handler;/*
