@@ -1,6 +1,6 @@
+// plugins/settramites.js
 const fs = require("fs");
 const path = require("path");
-const { downloadContentFromMessage } = require("@whiskeysockets/baileys");
 
 // ——— Helpers LID-aware ———
 const DIGITS = (s = "") => String(s).replace(/\D/g, "");
@@ -43,24 +43,53 @@ async function isAdminByNumber(conn, chatId, number) {
   }
 }
 
+/** Desencapsula viewOnce/ephemeral y retorna el nodo interno */
+function unwrapMessage(m) {
+  let node = m;
+  while (
+    node?.viewOnceMessage?.message ||
+    node?.viewOnceMessageV2?.message ||
+    node?.viewOnceMessageV2Extension?.message ||
+    node?.ephemeralMessage?.message
+  ) {
+    node =
+      node.viewOnceMessage?.message ||
+      node.viewOnceMessageV2?.message ||
+      node.viewOnceMessageV2Extension?.message ||
+      node.ephemeralMessage?.message;
+  }
+  return node;
+}
+
 /** Extrae texto del mensaje citado (preserva saltos/espacios) */
 function getQuotedText(msg) {
   const q = msg?.message?.extendedTextMessage?.contextInfo?.quotedMessage;
   if (!q) return null;
+  const inner = unwrapMessage(q);
   return (
-    q.conversation ||
-    q?.extendedTextMessage?.text ||
-    q?.ephemeralMessage?.message?.conversation ||
-    q?.ephemeralMessage?.message?.extendedTextMessage?.text ||
-    q?.viewOnceMessageV2?.message?.conversation ||
-    q?.viewOnceMessageV2?.message?.extendedTextMessage?.text ||
-    q?.viewOnceMessageV2Extension?.message?.conversation ||
-    q?.viewOnceMessageV2Extension?.message?.extendedTextMessage?.text ||
+    inner?.conversation ||
+    inner?.extendedTextMessage?.text ||
     null
   );
 }
 
-const handler = async (msg, { conn, args, text }) => {
+/** Extrae imageMessage del citado (soporta viewOnce/ephemeral) */
+function getQuotedImageMessage(msg) {
+  const q = msg?.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+  if (!q) return null;
+  const inner = unwrapMessage(q);
+  return inner?.imageMessage || null;
+}
+
+/** Obtiene wa.downloadContentFromMessage desde donde esté inyectado */
+function ensureWA(wa, conn) {
+  if (wa && typeof wa.downloadContentFromMessage === "function") return wa;
+  if (conn && conn.wa && typeof conn.wa.downloadContentFromMessage === "function") return conn.wa;
+  if (global.wa && typeof global.wa.downloadContentFromMessage === "function") return global.wa;
+  return null;
+}
+
+const handler = async (msg, { conn, args, text, wa }) => {
   const chatId    = msg.key.remoteJid;
   const isGroup   = chatId.endsWith("@g.us");
   const senderJid = msg.key.participant || msg.key.remoteJid; // puede ser @lid
@@ -85,11 +114,10 @@ const handler = async (msg, { conn, args, text }) => {
   const textoCrudo = textoArg;
 
   // Texto del citado si no escribieron nada
-  const quotedText = !textoCrudo ? getQuotedText(msg) : null;
+  const quotedText  = !textoCrudo ? getQuotedText(msg) : null;
 
-  // ¿Imagen citada?
-  const ctx = msg.message?.extendedTextMessage?.contextInfo;
-  const quotedImage = ctx?.quotedMessage?.imageMessage;
+  // ¿Imagen citada? (viewOnce/ephemeral soportado)
+  const quotedImage = getQuotedImageMessage(msg);
 
   if (!textoCrudo && !quotedText && !quotedImage) {
     return conn.sendMessage(
@@ -103,10 +131,12 @@ const handler = async (msg, { conn, args, text }) => {
   let imagenBase64 = null;
   if (quotedImage) {
     try {
-      const stream = await downloadContentFromMessage(quotedImage, "image");
+      const WA = ensureWA(wa, conn);
+      if (!WA) throw new Error("downloadContentFromMessage no disponible");
+      const stream = await WA.downloadContentFromMessage(quotedImage, "image");
       let buffer = Buffer.alloc(0);
       for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
-      imagenBase64 = buffer.toString("base64");
+      if (buffer.length) imagenBase64 = buffer.toString("base64");
     } catch (e) {
       console.error("[settramites] error leyendo imagen citada:", e);
     }
