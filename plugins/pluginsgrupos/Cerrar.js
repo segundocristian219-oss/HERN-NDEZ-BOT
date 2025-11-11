@@ -4,22 +4,16 @@ const path = require("path");
 
 const DIGITS = (s = "") => String(s).replace(/\D/g, "");
 
-/** Normaliza: si el participante viene como @lid y tiene .jid (real), usa el real */
 function lidParser(participants = []) {
   try {
     return participants.map(v => ({
-      id: (typeof v?.id === "string" && v.id.endsWith("@lid") && v.jid)
-        ? v.jid
-        : v.id,
+      id: (typeof v?.id === "string" && v.id.endsWith("@lid") && v.jid) ? v.jid : v.id,
       admin: v?.admin ?? null,
       raw: v
     }));
-  } catch {
-    return participants || [];
-  }
+  } catch { return participants || []; }
 }
 
-/** Verifica admin por NÚMERO, funcionando en grupos LID y no-LID */
 async function isAdminByNumber(conn, chatId, number) {
   try {
     const meta = await conn.groupMetadata(chatId);
@@ -39,9 +33,7 @@ async function isAdminByNumber(conn, chatId, number) {
       }
     }
     return adminNums.has(number);
-  } catch {
-    return false;
-  }
+  } catch { return false; }
 }
 
 const handler = async (msg, { conn, args }) => {
@@ -55,14 +47,11 @@ const handler = async (msg, { conn, args }) => {
     return conn.sendMessage(chatId, { text: "❌ Este comando solo puede usarse en grupos." }, { quoted: msg });
   }
 
-  // ✅ Admin / Owner (LID-aware)
   const isAdmin = await isAdminByNumber(conn, chatId, senderNum);
   const isOwner = Array.isArray(global.owner) && global.owner.some(([id]) => id === senderNum);
 
   if (!isAdmin && !isOwner && !isFromMe) {
-    return conn.sendMessage(chatId, {
-      text: "🚫 Solo administradores u owners pueden usar este comando."
-    }, { quoted: msg });
+    return conn.sendMessage(chatId, { text: "🚫 Solo administradores u owners pueden usar este comando." }, { quoted: msg });
   }
 
   if (!args?.[0]) {
@@ -87,7 +76,8 @@ const handler = async (msg, { conn, args }) => {
 
   if (ms <= 0) return;
 
-  const filePath = path.resolve("setwelcome.json");
+  // ✅ Guardar programación en tiempogrupo2.json
+  const filePath = path.resolve("tiempogrupo2.json");
   const data = fs.existsSync(filePath) ? JSON.parse(fs.readFileSync(filePath, "utf-8")) : {};
   if (!data[chatId]) data[chatId] = {};
 
