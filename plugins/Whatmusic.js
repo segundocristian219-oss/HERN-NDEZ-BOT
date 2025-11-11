@@ -1,4 +1,4 @@
-// plugins/whatmusic.js
+// plugins/whatmusic.js — ESM-safe (usa wa.download y fallback dinámico)
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
@@ -6,17 +6,15 @@ const ffmpeg = require('fluent-ffmpeg');
 const FormData = require('form-data');
 const { promisify } = require('util');
 const { pipeline } = require('stream');
-const { downloadContentFromMessage } = require('@whiskeysockets/baileys');
 const yts = require('yt-search');
 
 const streamPipeline = promisify(pipeline);
 
-// —— Config ——
+// Config
 const CDN_UPLOAD = 'https://cdn.russellxz.click/upload.php';
 const NEOXR_KEY  = 'russellxz';
 
-// —— Helpers ——
-// Desanidar mensajes (ephemeral / viewOnce / etc.)
+// Helpers
 function unwrapMessage(m) {
   let n = m;
   while (
@@ -33,7 +31,6 @@ function unwrapMessage(m) {
   }
   return n;
 }
-
 function getQuoted(msg) {
   const root = unwrapMessage(msg?.message) || {};
   const ci =
@@ -46,7 +43,6 @@ function getQuoted(msg) {
     null;
   return ci?.quotedMessage ? unwrapMessage(ci.quotedMessage) : null;
 }
-
 function extFromMime(m) {
   if (!m) return null;
   m = String(m).toLowerCase();
@@ -62,7 +58,6 @@ function extFromMime(m) {
   };
   return map[m] || null;
 }
-
 async function downloadToFile(DL, node, type, outPath) {
   const stream = await DL(node, type);
   const ws = fs.createWriteStream(outPath);
@@ -70,11 +65,7 @@ async function downloadToFile(DL, node, type, outPath) {
   ws.end();
   await new Promise(r => ws.on('finish', r));
 }
-
-function safeUnlink(p) {
-  try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch {}
-}
-
+function safeUnlink(p) { try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch {} }
 function slug(s) {
   return String(s || '')
     .normalize('NFKD')
@@ -85,24 +76,24 @@ function slug(s) {
 }
 
 const handler = async (msg, { conn, wa }) => {
-  // 👇 usar wa.downloadContentFromMessage si existe; si no, fallback a Baileys
+  // Downloader: usa wa si existe; si no, import dinámico (sin require ESM)
   const DL = (wa && typeof wa.downloadContentFromMessage === 'function')
     ? wa.downloadContentFromMessage
-    : downloadContentFromMessage;
+    : (await import('@whiskeysockets/baileys')).downloadContentFromMessage;
 
   const chatId = msg.key.remoteJid;
-  const rawID = conn.user?.id || '';
-  const subbotID = rawID.split(':')[0] + '@s.whatsapp.net';
 
-  // Prefijo por sub-bot (si existe)
-  const prefixPath = path.resolve('prefixes.json');
+  // Prefijo por subbot (opcional)
   let usedPrefix = '.';
-  if (fs.existsSync(prefixPath)) {
-    try {
+  try {
+    const rawID = conn.user?.id || '';
+    const subbotID = rawID.split(':')[0] + '@s.whatsapp.net';
+    const prefixPath = path.resolve('prefixes.json');
+    if (fs.existsSync(prefixPath)) {
       const pf = JSON.parse(fs.readFileSync(prefixPath, 'utf-8'));
       usedPrefix = pf[subbotID] || '.';
-    } catch {}
-  }
+    }
+  } catch {}
 
   const q = getQuoted(msg);
   const qAudio = q?.audioMessage || null;
@@ -121,32 +112,31 @@ const handler = async (msg, { conn, wa }) => {
   if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
 
   let inputPath, rawExt, mime, type;
+
   try {
     type = qAudio ? 'audio' : 'video';
     mime = (qAudio || qVideo).mimetype || (qAudio ? 'audio/mpeg' : 'video/mp4');
     rawExt = extFromMime(mime) || (qAudio ? 'mp3' : 'mp4');
     inputPath = path.join(tmpDir, `${Date.now()}_in.${rawExt}`);
 
-    // Descargar media citado (con DL que usa wa si existe)
+    // 1) Descargar el citado
     await downloadToFile(DL, qAudio || qVideo, type, inputPath);
 
-    // Subir al CDN para obtener URL
+    // 2) Subir al CDN
     const form = new FormData();
     form.append('file', fs.createReadStream(inputPath));
     form.append('expiry', '3600');
     const up = await axios.post(CDN_UPLOAD, form, { headers: form.getHeaders(), timeout: 120000 });
-
     if (!up.data?.url) throw new Error('No se pudo subir el archivo al CDN.');
     const fileUrl = up.data.url;
 
-    // Identificar la canción con neoxr
+    // 3) Identificar canción
     const apiURL = `https://api.neoxr.eu/api/whatmusic?url=${encodeURIComponent(fileUrl)}&apikey=${NEOXR_KEY}`;
     const res = await axios.get(apiURL, { timeout: 120000 });
-
     if (!res.data?.status || !res.data?.data) throw new Error('No se pudo identificar la canción.');
     const { title, artist, album, release } = res.data.data;
 
-    // Buscar en YouTube
+    // 4) Buscar en YouTube
     const yt = await yts(`${title} ${artist}`);
     const video = yt?.videos?.[0];
     if (!video) throw new Error('No se encontró la canción en YouTube.');
@@ -176,12 +166,11 @@ const handler = async (msg, { conn, wa }) => {
       caption: banner
     }, { quoted: msg });
 
-    // Descargar audio de YouTube vía neoxr
+    // 5) Descargar audio (128 kbps) y convertir a MP3
     const yta = await axios.get(
       `https://api.neoxr.eu/api/youtube?url=${encodeURIComponent(video.url)}&type=audio&quality=128kbps&apikey=${NEOXR_KEY}`,
       { timeout: 180000 }
     );
-
     const audioURL = yta?.data?.data?.url;
     if (!audioURL) throw new Error('No pude obtener el audio desde YouTube.');
 
@@ -191,7 +180,6 @@ const handler = async (msg, { conn, wa }) => {
     const audioStream = await axios.get(audioURL, { responseType: 'stream', timeout: 300000 });
     await streamPipeline(audioStream.data, fs.createWriteStream(rawPath));
 
-    // Convertir a MP3 (libmp3lame, 128k)
     await new Promise((resolve, reject) => {
       ffmpeg(rawPath)
         .audioCodec('libmp3lame')
@@ -224,11 +212,7 @@ const handler = async (msg, { conn, wa }) => {
   } finally {
     try {
       const files = fs.readdirSync(tmpDir);
-      for (const f of files) {
-        if (/_in\.|_raw\.|\.mp3$|\.m4a$/i.test(f)) {
-          safeUnlink(path.join(tmpDir, f));
-        }
-      }
+      for (const f of files) if (/_in\.|_raw\.|\.mp3$|\.m4a$/i.test(f)) safeUnlink(path.join(tmpDir, f));
     } catch {}
   }
 };
