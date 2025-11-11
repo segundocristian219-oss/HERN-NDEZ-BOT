@@ -38,7 +38,9 @@ let canalNombre = ["👑 LA SUKI BOT 👑"]
     });
   };
   }
-const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } = require("@whiskeysockets/baileys");
+
+
+// ❌ QUITADO: const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } = require("@whiskeysockets/baileys");
 const { readdirSync } = require("fs");
 const fs = require("fs");
 const path = require("path");
@@ -48,7 +50,7 @@ const readline = require("readline");
 const pino = require("pino");
 const { setConfig, getConfig } = require("./db");
 // 🌐 Prefijos personalizados desde prefijos.json o por defecto
-const { downloadContentFromMessage } = require("@whiskeysockets/baileys");
+// ❌ QUITADO: const { downloadContentFromMessage } = require("@whiskeysockets/baileys");
 let defaultPrefixes = [".", "#"];
 const prefixPath = "./prefijos.json";
 global.requireFromRoot = (mod) => require(path.join(__dirname, mod));
@@ -114,6 +116,15 @@ let method = "1";
 let phoneNumber = "";
 
 (async () => {
+  // ✅ NUEVO: importar Baileys (ESM) dinámicamente desde CJS
+  const {
+    default: makeWASocket,
+    useMultiFileAuthState,
+    makeCacheableSignalKeyStore,
+    fetchLatestWaWebVersion,      // ← reemplaza a fetchLatestBaileysVersion
+    downloadContentFromMessage    // ← lo usas más abajo (antidelete, etc.)
+  } = await import('@whiskeysockets/baileys');
+
   const { state, saveCreds } = await useMultiFileAuthState("./sessions");
 
   if (!fs.existsSync("./sessions/creds.json")) {
@@ -128,7 +139,9 @@ let phoneNumber = "";
 
   async function startBot() {
     try {
-      const { version } = await fetchLatestBaileysVersion();
+      // ✅ CAMBIO: usar fetchLatestWaWebVersion()
+      const { version } = await fetchLatestWaWebVersion();
+
       const sock = makeWASocket({ 
         version,
         logger: pino({ level: "silent" }),
@@ -140,33 +153,32 @@ let phoneNumber = "";
         printQRInTerminal: method === "1",
       });
       setupConnection(sock)
-// 🔧 Normaliza participants: si id es @lid y existe .jid (real), reemplaza por el real
-sock.lidParser = function (participants = []) {
-  try {
-    return participants.map(v => ({
-      ...v,
-      id: (typeof v?.id === "string" && v.id.endsWith("@lid") && v.jid)
-        ? v.jid  // usa el real si lo trae
-        : v.id   // deja tal cual
-    }));
-  } catch (e) {
-    console.error("[lidParser] error:", e);
-    return participants || [];
-  }
-};      
+      // 🔧 Normaliza participants: si id es @lid y existe .jid (real), reemplaza por el real
+      sock.lidParser = function (participants = []) {
+        try {
+          return participants.map(v => ({
+            ...v,
+            id: (typeof v?.id === "string" && v.id.endsWith("@lid") && v.jid)
+              ? v.jid  // usa el real si lo trae
+              : v.id   // deja tal cual
+          }));
+        } catch (e) {
+          console.error("[lidParser] error:", e);
+          return participants || [];
+        }
+      };      
 
-      
-// 🧠 Ejecutar plugins con eventos especiales como bienvenida
-for (const plugin of global.plugins) {
-  if (typeof plugin.run === "function") {
-    try {
-      plugin.run(sock); // ahora sí existe sock
-      console.log(chalk.magenta("🧠 Plugin con eventos conectado"));
-    } catch (e) {
-      console.error(chalk.red("❌ Error al ejecutar evento del plugin:"), e);
-    }
-  }
-}
+      // 🧠 Ejecutar plugins con eventos especiales como bienvenida
+      for (const plugin of global.plugins) {
+        if (typeof plugin.run === "function") {
+          try {
+            plugin.run(sock); // ahora sí existe sock
+            console.log(chalk.magenta("🧠 Plugin con eventos conectado"));
+          } catch (e) {
+            console.error(chalk.red("❌ Error al ejecutar evento del plugin:"), e);
+          }
+        }
+      }
       
       if (!fs.existsSync("./sessions/creds.json") && method === "2") {
         setTimeout(async () => {
@@ -174,9 +186,6 @@ for (const plugin of global.plugins) {
           console.log(chalk.magenta("🔑 Código de vinculación: ") + chalk.yellow(code.match(/.{1,4}/g).join("-")));
         }, 2000);
       }
-//bienvenidad sistema
-
-
       
       // 💬 Manejo de mensajes
 sock.ev.on("messages.upsert", async ({ messages }) => {
