@@ -3,10 +3,31 @@ const path = require('path');
 const { promisify } = require('util');
 const exec = promisify(require('child_process').exec);
 
+// Desencapsula view-once/ephemeral
+const unwrap = (m) => {
+  let n = m;
+  while (
+    n?.viewOnceMessage?.message ||
+    n?.viewOnceMessageV2?.message ||
+    n?.viewOnceMessageV2Extension?.message ||
+    n?.ephemeralMessage?.message
+  ) {
+    n =
+      n.viewOnceMessage?.message ||
+      n.viewOnceMessageV2?.message ||
+      n.viewOnceMessageV2Extension?.message ||
+      n.ephemeralMessage?.message;
+  }
+  return n;
+};
+
 const handler = async (msg, { conn, wa }) => {
   try {
-    // Verificar si se está respondiendo a un sticker
-    if (!msg.message?.extendedTextMessage?.contextInfo?.quotedMessage?.stickerMessage) {
+    const ctx = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+    const inner = unwrap(ctx);
+    const sticker = inner?.stickerMessage;
+
+    if (!sticker) {
       return conn.sendMessage(
         msg.key.remoteJid,
         { text: "⚠️ *Debes responder a un sticker para convertirlo en imagen.*" },
@@ -14,57 +35,51 @@ const handler = async (msg, { conn, wa }) => {
       );
     }
 
-    // Reacción de proceso
+    // ✅ Asegura downloadContentFromMessage aunque 'wa' no venga
+    const dcfm =
+      wa?.downloadContentFromMessage ||
+      (await import("@whiskeysockets/baileys")).downloadContentFromMessage;
+
     await conn.sendMessage(msg.key.remoteJid, { react: { text: "⏳", key: msg.key } });
 
-    // Obtener el sticker citado
-    const quoted = msg.message.extendedTextMessage.contextInfo.quotedMessage.stickerMessage;
-    const stickerStream = await wa.downloadContentFromMessage(quoted, "sticker");
-
-    // Leer el buffer del sticker
+    const stream = await dcfm(sticker, "sticker");
     let buffer = Buffer.alloc(0);
-    for await (const chunk of stickerStream) buffer = Buffer.concat([buffer, chunk]);
+    for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
 
-    if (buffer.length === 0) throw new Error("Buffer vacío");
+    if (!buffer.length) throw new Error("Buffer vacío");
 
-    // Crear directorio temporal si no existe
+    // Dir temporal
     const tmpDir = path.join(__dirname, "../tmp");
     if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
 
-    // Rutas de archivos temporales
     const base = Date.now();
     const stickerPath = path.join(tmpDir, `${base}.webp`);
     const imagePath = path.join(tmpDir, `${base}.png`);
 
-    // Guardar sticker temporalmente
     fs.writeFileSync(stickerPath, buffer);
 
-    // Convertir usando ffmpeg
     try {
+      // Convierte WEBP -> PNG (requiere ffmpeg disponible en el contenedor)
       await exec(`ffmpeg -y -i "${stickerPath}" -vcodec png "${imagePath}"`);
 
-      // Verificar si la conversión fue exitosa
       if (!fs.existsSync(imagePath)) throw new Error("La conversión falló");
 
-      // Enviar imagen resultante
       await conn.sendMessage(
         msg.key.remoteJid,
         { image: fs.readFileSync(imagePath), caption: "🖼️ *Imagen convertida del sticker*" },
         { quoted: msg }
       );
 
-      // Reacción de éxito
       await conn.sendMessage(msg.key.remoteJid, { react: { text: "✅", key: msg.key } });
-    } catch (convertError) {
-      console.error("Error en conversión:", convertError);
+    } catch (e) {
+      console.error("Error en conversión:", e);
       throw new Error("Error al convertir el sticker");
     } finally {
-      // Eliminar archivos temporales
       try {
         if (fs.existsSync(stickerPath)) fs.unlinkSync(stickerPath);
         if (fs.existsSync(imagePath)) fs.unlinkSync(imagePath);
-      } catch (cleanError) {
-        console.error("Error limpiando archivos:", cleanError);
+      } catch (cleanErr) {
+        console.error("Error limpiando archivos:", cleanErr);
       }
     }
   } catch (error) {
