@@ -1,19 +1,42 @@
+// plugins/ff2.js
 const fs = require('fs');
 const path = require('path');
 const ffmpeg = require('fluent-ffmpeg');
-const { downloadContentFromMessage } = require('@whiskeysockets/baileys');
-const { promisify } = require('util');
-const { pipeline } = require('stream');
-const streamPipeline = promisify(pipeline);
 
-const handler = async (msg, { conn }) => {
+// — helpers —
+function unwrapMessage(m) {
+  let node = m;
+  while (
+    node?.viewOnceMessage?.message ||
+    node?.viewOnceMessageV2?.message ||
+    node?.viewOnceMessageV2Extension?.message ||
+    node?.ephemeralMessage?.message
+  ) {
+    node =
+      node.viewOnceMessage?.message ||
+      node.viewOnceMessageV2?.message ||
+      node.viewOnceMessageV2Extension?.message ||
+      node.ephemeralMessage?.message;
+  }
+  return node;
+}
+function ensureWA(wa, conn) {
+  if (wa && typeof wa.downloadContentFromMessage === 'function') return wa;
+  if (conn && conn.wa && typeof conn.wa.downloadContentFromMessage === 'function') return conn.wa;
+  if (global.wa && typeof global.wa.downloadContentFromMessage === 'function') return global.wa;
+  return null;
+}
+
+const handler = async (msg, { conn, wa }) => {
   const chatId = msg.key.remoteJid;
   const pref = global.prefixes?.[0] || ".";
 
-  const quotedMsg = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
-  const audioMsg = quotedMsg?.audioMessage;
-  const docMsg = quotedMsg?.documentMessage;
-  const isAudioDoc = docMsg?.mimetype?.startsWith("audio");
+  const quotedRaw = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+  const q = quotedRaw ? unwrapMessage(quotedRaw) : null;
+
+  const audioMsg = q?.audioMessage || null;
+  const docMsg   = q?.documentMessage || null;
+  const isAudioDoc = !!(docMsg?.mimetype && docMsg.mimetype.startsWith('audio'));
 
   if (!audioMsg && !isAudioDoc) {
     return conn.sendMessage(chatId, {
@@ -21,28 +44,53 @@ const handler = async (msg, { conn }) => {
     }, { quoted: msg });
   }
 
-  await conn.sendMessage(chatId, {
-    react: { text: '🎧', key: msg.key }
-  });
+  await conn.sendMessage(chatId, { react: { text: '🎧', key: msg.key } }).catch(() => {});
 
+  // temp paths
+  const tmpDir = path.join(__dirname, '../tmp');
+  if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+  const base = Date.now();
+  const inputPath  = path.join(tmpDir, `${base}_raw`);
+  const outputPath = path.join(tmpDir, `${base}_fixed.mp3`);
+
+  let sentReact = '🎧';
   try {
-    const tmpDir = path.join(__dirname, 'tmp');
-    if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir);
+    const WA = ensureWA(wa, conn);
+    if (!WA) throw new Error('downloadContentFromMessage no disponible');
 
-    const inputPath = path.join(tmpDir, `${Date.now()}_raw.mp3`);
-    const outputPath = path.join(tmpDir, `${Date.now()}_fixed.mp3`);
+    // Selección de tipo de descarga correcta
+    const node = audioMsg ? audioMsg : docMsg;
+    const dlType = audioMsg ? 'audio' : 'document';
 
-    const stream = await downloadContentFromMessage(audioMsg ? audioMsg : docMsg, 'audio');
-    const writable = fs.createWriteStream(inputPath);
-    for await (const chunk of stream) writable.write(chunk);
-    writable.end();
+    const stream = await WA.downloadContentFromMessage(node, dlType);
+    let buf = Buffer.alloc(0);
+    for await (const chunk of stream) buf = Buffer.concat([buf, chunk]);
+    if (!buf.length) throw new Error('Descarga vacía');
+
+    // Extensión de entrada por mimetype si existe
+    let inExt = 'bin';
+    const mt = node.mimetype || '';
+    if (mt.includes('mpeg')) inExt = 'mp3';
+    else if (mt.includes('ogg')) inExt = 'ogg';
+    else if (mt.includes('opus')) inExt = 'ogg';
+    else if (mt.includes('x-opus+ogg')) inExt = 'ogg';
+    else if (mt.includes('wav')) inExt = 'wav';
+    else if (mt.includes('aac')) inExt = 'aac';
+    else if (mt.includes('m4a')) inExt = 'm4a';
+    const inputFile = `${inputPath}.${inExt}`;
+
+    fs.writeFileSync(inputFile, buf);
 
     const startTime = Date.now();
 
+    // Reparar/normalizar a MP3 128k (WhatsApp-friendly)
     await new Promise((resolve, reject) => {
-      ffmpeg(inputPath)
+      ffmpeg(inputFile)
+        .noVideo()
         .audioCodec('libmp3lame')
         .audioBitrate('128k')
+        .audioFrequency(44100)
+        .audioChannels(2)
         .format('mp3')
         .save(outputPath)
         .on('end', resolve)
@@ -54,27 +102,29 @@ const handler = async (msg, { conn }) => {
     await conn.sendMessage(chatId, {
       audio: fs.readFileSync(outputPath),
       mimetype: 'audio/mpeg',
-      fileName: `audio_reparado.mp3`,
-      ptt: audioMsg?.ptt || false,
-      caption: `✅ *Audio reparado exitosamente*\n⏱️ *Tiempo de reparación:* ${endTime}s\n\n🎧 *Procesado por La Suki Bot*`
+      fileName: 'audio_reparado.mp3',
+      // si era nota de voz, mantenemos ptt
+      ptt: !!(audioMsg?.ptt)
     }, { quoted: msg });
 
-    fs.unlinkSync(inputPath);
-    fs.unlinkSync(outputPath);
-
     await conn.sendMessage(chatId, {
-      react: { text: '✅', key: msg.key }
-    });
+      text: `✅ *Audio reparado exitosamente*\n⏱️ *Tiempo de reparación:* ${endTime}s\n\n🎧 *Procesado por La Suki Bot*`
+    }, { quoted: msg });
 
+    sentReact = '✅';
   } catch (err) {
-    console.error('❌ Error en .ff2:', err.message);
+    console.error('❌ Error en .ff2:', err);
     await conn.sendMessage(chatId, {
-      text: `❌ *Ocurrió un error al reparar el audio:*\n_${err.message}_`
+      text: `❌ *Ocurrió un error al reparar el audio:*\n_${err?.message || err}_`
     }, { quoted: msg });
-
-    await conn.sendMessage(chatId, {
-      react: { text: '❌', key: msg.key }
-    });
+    sentReact = '❌';
+  } finally {
+    // cleanup
+    try {
+      const files = fs.readdirSync(tmpDir).filter(f => f.startsWith(String(base)));
+      for (const f of files) fs.unlinkSync(path.join(tmpDir, f));
+    } catch {}
+    await conn.sendMessage(chatId, { react: { text: sentReact, key: msg.key } }).catch(() => {});
   }
 };
 
