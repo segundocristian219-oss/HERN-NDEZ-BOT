@@ -6,13 +6,57 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
-const handler = async (msg, { conn }) => {
-  const quoted = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+// ——— helpers ———
+function unwrapMessage(m) {
+  let n = m;
+  while (
+    n?.viewOnceMessage?.message ||
+    n?.viewOnceMessageV2?.message ||
+    n?.viewOnceMessageV2Extension?.message ||
+    n?.ephemeralMessage?.message
+  ) {
+    n =
+      n.viewOnceMessage?.message ||
+      n.viewOnceMessageV2?.message ||
+      n.viewOnceMessageV2Extension?.message ||
+      n.ephemeralMessage?.message;
+  }
+  return n;
+}
+function getQuotedMessage(msg) {
+  const root = unwrapMessage(msg?.message) || {};
+  const ctxs = [
+    root?.extendedTextMessage?.contextInfo,
+    root?.imageMessage?.contextInfo,
+    root?.videoMessage?.contextInfo,
+    root?.audioMessage?.contextInfo,
+    root?.documentMessage?.contextInfo,
+    root?.stickerMessage?.contextInfo,
+  ].filter(Boolean);
+  for (const c of ctxs) if (c?.quotedMessage) return unwrapMessage(c.quotedMessage);
+  return null;
+}
+async function downloadToBuffer(DL, type, content) {
+  const stream = await DL(content, type);
+  let buf = Buffer.alloc(0);
+  for await (const chunk of stream) buf = Buffer.concat([buf, chunk]);
+  return buf;
+}
+function safeUnlink(p) {
+  try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch {}
+}
+
+const handler = async (msg, { conn, wa }) => {
   const chatId = msg.key.remoteJid;
 
-  // Reacción inicial
-  await conn.sendMessage(chatId, { react: { text: "🔍", key: msg.key } });
+  // Preferir wa.downloadContentFromMessage si el dispatcher lo expone
+  const DL = (wa && typeof wa.downloadContentFromMessage === "function")
+    ? wa.downloadContentFromMessage
+    : downloadContentFromMessage;
 
+  try { await conn.sendMessage(chatId, { react: { text: "🔍", key: msg.key } }); } catch {}
+
+  const quoted = getQuotedMessage(msg);
   if (!quoted) {
     return conn.sendMessage(
       chatId,
@@ -21,88 +65,80 @@ const handler = async (msg, { conn }) => {
     );
   }
 
-  let buffer, mimeType;
-
-  if (quoted.videoMessage) {
-    // --- Video: conviértelo a WebP (una sola imagen estática) ---
-    const stream = await downloadContentFromMessage(quoted.videoMessage, "video");
-    buffer = Buffer.alloc(0);
-    for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
-
-    // Archivos temporales
-    const tmpId = msg.key.id.replace(/[^a-zA-Z0-9]/g, "");
-    const inputPath = path.join(os.tmpdir(), `${tmpId}.mp4`);
-    const outputPath = path.join(os.tmpdir(), `${tmpId}.webp`);
-    await fs.promises.writeFile(inputPath, buffer);
-
-    // Extrae un frame y guarda como WebP
-    await new Promise((resolve, reject) => {
-      ffmpeg(inputPath)
-        .outputOptions([
-          "-vframes 1",                                // solo 1 fotograma
-          "-vf scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:-1:-1:color=white@0.0",
-          "-vcodec libwebp",
-          "-qscale 80"
-        ])
-        .save(outputPath)
-        .on("end", resolve)
-        .on("error", reject);
-    });
-
-    buffer = await fs.promises.readFile(outputPath);
-    mimeType = "image/webp";
-
-    // Limpia temporales
-    fs.unlink(inputPath, ()=>{});
-    fs.unlink(outputPath, ()=>{});
-
-  } else if (quoted.imageMessage || quoted.stickerMessage) {
-    // --- Imagen o sticker: igual que antes ---
-    const mediaType = quoted.imageMessage ? "image" : "sticker";
-    const media = quoted.imageMessage || quoted.stickerMessage;
-    mimeType = media.mimetype || "image/png";
-
-    const stream = await downloadContentFromMessage(media, mediaType);
-    buffer = Buffer.alloc(0);
-    for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
-  } else {
-    return conn.sendMessage(
-      chatId,
-      { text: "❌ *Tipo no soportado. Usa video, imagen o sticker.*" },
-      { quoted: msg }
-    );
-  }
+  let buffer = null, mimeType = "image/png";
+  const tmpId = (msg.key.id || String(Date.now())).replace(/[^a-zA-Z0-9]/g, "");
+  const inPath  = path.join(os.tmpdir(), `${tmpId}.mp4`);
+  const outPath = path.join(os.tmpdir(), `${tmpId}.webp`);
 
   try {
-    // Analiza con Checker NSFW
+    if (quoted.videoMessage) {
+      // 1) Descargar video
+      const vbuf = await downloadToBuffer(DL, "video", quoted.videoMessage);
+      await fs.promises.writeFile(inPath, vbuf);
+
+      // 2) Extraer 1 frame y convertir a webp 512x512 padded
+      await new Promise((resolve, reject) => {
+        ffmpeg(inPath)
+          .outputOptions([
+            "-vframes 1",
+            "-vf",
+            "thumbnail,scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=white@0.0,setsar=1",
+            "-vcodec", "libwebp",
+            "-q:v", "80"
+          ])
+          .save(outPath)
+          .on("end", resolve)
+          .on("error", reject);
+      });
+
+      buffer = await fs.promises.readFile(outPath);
+      mimeType = "image/webp";
+    } else if (quoted.imageMessage || quoted.stickerMessage) {
+      const isSticker = !!quoted.stickerMessage;
+      const node = isSticker ? quoted.stickerMessage : quoted.imageMessage;
+      const type = isSticker ? "sticker" : "image";
+      buffer = await downloadToBuffer(DL, type, node);
+      mimeType = node.mimetype || (isSticker ? "image/webp" : "image/png");
+    } else {
+      return conn.sendMessage(
+        chatId,
+        { text: "❌ *Tipo no soportado. Usa video, imagen o sticker.*" },
+        { quoted: msg }
+      );
+    }
+
+    // ——— Análisis NSFW ———
     const checker = new Checker();
     const result = await checker.response(buffer, mimeType);
+    if (!result?.status) throw new Error(result?.msg || "Error desconocido del analizador.");
 
-    if (!result.status) throw new Error(result.msg || "Error desconocido.");
-
-    const { NSFW, percentage, response } = result.result;
-    const estado = NSFW
-      ? "🔞 *NSFW detectado*"
-      : "✅ *Contenido seguro*";
-
-    // Envía resultado
+    const { NSFW, percentage, response } = result.result || {};
+    const estado = NSFW ? "🔞 *NSFW detectado*" : "✅ *Contenido seguro*";
     await conn.sendMessage(
       chatId,
-      { text: `${estado}\n📊 *Confianza:* ${percentage}\n\n${response}` },
+      { text: `${estado}\n📊 *Confianza:* ${percentage}\n\n${response || ""}`.trim() },
       { quoted: msg }
     );
+
+    try { await conn.sendMessage(chatId, { react: { text: "✅", key: msg.key } }); } catch {}
 
   } catch (err) {
-    console.error("❌ Error en comando xxx2:", err);
+    console.error("[xxx] NSFW error:", err?.message || err);
     await conn.sendMessage(
       chatId,
-      { text: `❌ *Error al analizar el archivo:* ${err.message}` },
+      { text: `❌ *Error al analizar el archivo:* ${err?.message || "Fallo desconocido."}` },
       { quoted: msg }
     );
+    try { await conn.sendMessage(chatId, { react: { text: "❌", key: msg.key } }); } catch {}
+  } finally {
+    safeUnlink(inPath);
+    safeUnlink(outPath);
   }
 };
 
 handler.command = ["xxx"];
 handler.tags = ["tools"];
 handler.help = ["xxx <responde a un video, imagen o sticker>"];
+handler.register = true;
+
 module.exports = handler;
