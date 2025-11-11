@@ -1,17 +1,14 @@
 // plugins/setfoto.js
 const fs = require("fs");
 const path = require("path");
-const { downloadContentFromMessage } = require("@whiskeysockets/baileys");
 
 const DIGITS = (s = "") => String(s).replace(/\D/g, "");
 
-/** Normaliza: si el participante viene como @lid y tiene .jid (real), usa el real */
+/** LID → JID real si viene @lid con .jid */
 function lidParser(participants = []) {
   try {
     return participants.map(v => ({
-      id: (typeof v?.id === "string" && v.id.endsWith("@lid") && v.jid)
-        ? v.jid
-        : v.id,
+      id: (typeof v?.id === "string" && v.id.endsWith("@lid") && v.jid) ? v.jid : v.id,
       admin: v?.admin ?? null,
       raw: v
     }));
@@ -20,7 +17,7 @@ function lidParser(participants = []) {
   }
 }
 
-/** Verifica admin por NÚMERO (sirve en LID y no-LID) */
+/** Admin por número (sirve con LID y sin LID) */
 async function isAdminByNumber(conn, chatId, number) {
   try {
     const meta = await conn.groupMetadata(chatId);
@@ -45,20 +42,41 @@ async function isAdminByNumber(conn, chatId, number) {
   }
 }
 
-/** Extrae la imageMessage del mensaje citado (maneja ephemeral/viewOnce) */
+/** Desencapsula viewOnce/ephemeral para acceder al mensaje real */
+function unwrapMessage(m) {
+  let node = m;
+  while (
+    node?.viewOnceMessage?.message ||
+    node?.viewOnceMessageV2?.message ||
+    node?.viewOnceMessageV2Extension?.message ||
+    node?.ephemeralMessage?.message
+  ) {
+    node =
+      node.viewOnceMessage?.message ||
+      node.viewOnceMessageV2?.message ||
+      node.viewOnceMessageV2Extension?.message ||
+      node.ephemeralMessage?.message;
+  }
+  return node;
+}
+
+/** Extrae la imageMessage del citado (soporta viewOnce/ephemeral) */
 function getQuotedImageMessage(msg) {
   const q = msg?.message?.extendedTextMessage?.contextInfo?.quotedMessage;
   if (!q) return null;
-  return (
-    q.imageMessage ||
-    q?.ephemeralMessage?.message?.imageMessage ||
-    q?.viewOnceMessageV2?.message?.imageMessage ||
-    q?.viewOnceMessageV2Extension?.message?.imageMessage ||
-    null
-  );
+  const inner = unwrapMessage(q);
+  return inner?.imageMessage || null;
 }
 
-const handler = async (msg, { conn }) => {
+/** Asegura acceso a wa.downloadContentFromMessage inyectado */
+function ensureWA(wa, conn) {
+  if (wa && typeof wa.downloadContentFromMessage === "function") return wa;
+  if (conn && conn.wa && typeof conn.wa.downloadContentFromMessage === "function") return conn.wa;
+  if (global.wa && typeof global.wa.downloadContentFromMessage === "function") return global.wa;
+  return null;
+}
+
+const handler = async (msg, { conn, wa }) => {
   const chatId   = msg.key.remoteJid;
   const isGroup  = chatId.endsWith("@g.us");
   const senderId = msg.key.participant || msg.key.remoteJid; // puede ser @lid
@@ -91,13 +109,29 @@ const handler = async (msg, { conn }) => {
     return;
   }
 
+  const WA = ensureWA(wa, conn);
+  if (!WA) {
+    await conn.sendMessage(chatId, {
+      text: "❌ *No se pudo acceder a la función de descarga de Baileys (`downloadContentFromMessage`).*"
+    }, { quoted: msg });
+    return;
+  }
+
   try {
     await conn.sendMessage(chatId, { react: { text: "🖼️", key: msg.key } }).catch(() => {});
-    const stream = await downloadContentFromMessage(quotedImage, "image");
+    const stream = await WA.downloadContentFromMessage(quotedImage, "image");
     let buffer = Buffer.alloc(0);
     for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
 
-    await conn.updateProfilePicture(chatId, buffer);
+    if (!buffer?.length) throw new Error("Buffer vacío al leer la imagen citada");
+
+    // Baileys v6/v7: intentar nuevo formato primero y caer al antiguo si falla
+    try {
+      await conn.updateProfilePicture(chatId, { image: buffer });
+    } catch (e1) {
+      // Fallback (algunas versiones aceptan buffer directo)
+      await conn.updateProfilePicture(chatId, buffer);
+    }
 
     await conn.sendMessage(chatId, {
       text: "✅ *La foto del grupo ha sido actualizada con éxito.*"
