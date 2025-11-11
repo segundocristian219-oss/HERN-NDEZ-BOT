@@ -1,3 +1,4 @@
+// plugins/whatmusic.js
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
@@ -10,130 +11,231 @@ const yts = require('yt-search');
 
 const streamPipeline = promisify(pipeline);
 
-const handler = async (msg, { conn }) => {
-  const rawID = conn.user?.id || "";
-  const subbotID = rawID.split(":")[0] + "@s.whatsapp.net";
+// —— Config ——
+const CDN_UPLOAD = 'https://cdn.russellxz.click/upload.php';
+const NEOXR_KEY  = 'russellxz';
 
-  const prefixPath = path.resolve("prefixes.json");
-  let prefixes = {};
-  if (fs.existsSync(prefixPath)) {
-    prefixes = JSON.parse(fs.readFileSync(prefixPath, "utf-8"));
+// —— Helpers ——
+// Desanidar mensajes (ephemeral / viewOnce / etc.)
+function unwrapMessage(m) {
+  let n = m;
+  while (
+    n?.viewOnceMessage?.message ||
+    n?.viewOnceMessageV2?.message ||
+    n?.viewOnceMessageV2Extension?.message ||
+    n?.ephemeralMessage?.message
+  ) {
+    n =
+      n.viewOnceMessage?.message ||
+      n.viewOnceMessageV2?.message ||
+      n.viewOnceMessageV2Extension?.message ||
+      n.ephemeralMessage?.message;
   }
-  const usedPrefix = prefixes[subbotID] || ".";
+  return n;
+}
 
-  const quotedMsg = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
-  if (!quotedMsg || (!quotedMsg.audioMessage && !quotedMsg.videoMessage)) {
-    await conn.sendMessage(msg.key.remoteJid, {
-      text: `✳️ Responde a una *nota de voz*, *audio* o *video* para identificar la canción.`
+function getQuoted(msg) {
+  const root = unwrapMessage(msg?.message) || {};
+  const ci =
+    root?.extendedTextMessage?.contextInfo ||
+    root?.imageMessage?.contextInfo ||
+    root?.videoMessage?.contextInfo ||
+    root?.audioMessage?.contextInfo ||
+    root?.documentMessage?.contextInfo ||
+    root?.stickerMessage?.contextInfo ||
+    null;
+  return ci?.quotedMessage ? unwrapMessage(ci.quotedMessage) : null;
+}
+
+function extFromMime(m) {
+  if (!m) return null;
+  m = String(m).toLowerCase();
+  const map = {
+    'audio/mpeg': 'mp3',
+    'audio/mp4': 'm4a',
+    'audio/aac': 'aac',
+    'audio/ogg': 'ogg',
+    'audio/webm': 'webm',
+    'video/mp4': 'mp4',
+    'video/webm': 'webm',
+    'video/quicktime': 'mov',
+  };
+  return map[m] || null;
+}
+
+async function downloadToFile(DL, node, type, outPath) {
+  const stream = await DL(node, type);
+  const ws = fs.createWriteStream(outPath);
+  for await (const chunk of stream) ws.write(chunk);
+  ws.end();
+  await new Promise(r => ws.on('finish', r));
+}
+
+function safeUnlink(p) {
+  try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch {}
+}
+
+function slug(s) {
+  return String(s || '')
+    .normalize('NFKD')
+    .replace(/[^\w\s.-]/g, '')
+    .trim()
+    .replace(/\s+/g, '_')
+    .slice(0, 80) || `song_${Date.now()}`;
+}
+
+const handler = async (msg, { conn, wa }) => {
+  // 👇 usar wa.downloadContentFromMessage si existe; si no, fallback a Baileys
+  const DL = (wa && typeof wa.downloadContentFromMessage === 'function')
+    ? wa.downloadContentFromMessage
+    : downloadContentFromMessage;
+
+  const chatId = msg.key.remoteJid;
+  const rawID = conn.user?.id || '';
+  const subbotID = rawID.split(':')[0] + '@s.whatsapp.net';
+
+  // Prefijo por sub-bot (si existe)
+  const prefixPath = path.resolve('prefixes.json');
+  let usedPrefix = '.';
+  if (fs.existsSync(prefixPath)) {
+    try {
+      const pf = JSON.parse(fs.readFileSync(prefixPath, 'utf-8'));
+      usedPrefix = pf[subbotID] || '.';
+    } catch {}
+  }
+
+  const q = getQuoted(msg);
+  const qAudio = q?.audioMessage || null;
+  const qVideo = q?.videoMessage || null;
+
+  if (!qAudio && !qVideo) {
+    await conn.sendMessage(chatId, {
+      text: `✳️ Responde a una *nota de voz*, *audio* o *video* para identificar la canción.\n\nEjemplo: *${usedPrefix}whatmusic*`
     }, { quoted: msg });
     return;
   }
 
-  await conn.sendMessage(msg.key.remoteJid, {
-    react: { text: '🔍', key: msg.key }
-  });
+  try { await conn.sendMessage(chatId, { react: { text: '🔍', key: msg.key } }); } catch {}
 
+  const tmpDir = path.join(__dirname, '../tmp');
+  if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+
+  let inputPath, rawExt, mime, type;
   try {
-    const tmpDir = path.join(__dirname, '../tmp');
-    if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir);
-    const fileExt = quotedMsg.audioMessage ? 'mp3' : 'mp4';
-    const inputPath = path.join(tmpDir, `${Date.now()}.${fileExt}`);
+    type = qAudio ? 'audio' : 'video';
+    mime = (qAudio || qVideo).mimetype || (qAudio ? 'audio/mpeg' : 'video/mp4');
+    rawExt = extFromMime(mime) || (qAudio ? 'mp3' : 'mp4');
+    inputPath = path.join(tmpDir, `${Date.now()}_in.${rawExt}`);
 
-    const stream = await downloadContentFromMessage(
-      quotedMsg.audioMessage || quotedMsg.videoMessage,
-      quotedMsg.audioMessage ? 'audio' : 'video'
-    );
-    const writer = fs.createWriteStream(inputPath);
-    for await (const chunk of stream) writer.write(chunk);
-    writer.end();
+    // Descargar media citado (con DL que usa wa si existe)
+    await downloadToFile(DL, qAudio || qVideo, type, inputPath);
 
+    // Subir al CDN para obtener URL
     const form = new FormData();
     form.append('file', fs.createReadStream(inputPath));
     form.append('expiry', '3600');
+    const up = await axios.post(CDN_UPLOAD, form, { headers: form.getHeaders(), timeout: 120000 });
 
-    const upload = await axios.post('https://cdn.russellxz.click/upload.php', form, {
-      headers: form.getHeaders()
-    });
+    if (!up.data?.url) throw new Error('No se pudo subir el archivo al CDN.');
+    const fileUrl = up.data.url;
 
-    if (!upload.data || !upload.data.url) throw new Error('No se pudo subir el archivo');
-    const fileUrl = upload.data.url;
+    // Identificar la canción con neoxr
+    const apiURL = `https://api.neoxr.eu/api/whatmusic?url=${encodeURIComponent(fileUrl)}&apikey=${NEOXR_KEY}`;
+    const res = await axios.get(apiURL, { timeout: 120000 });
 
-    const apiURL = `https://api.neoxr.eu/api/whatmusic?url=${encodeURIComponent(fileUrl)}&apikey=russellxz`;
-    const res = await axios.get(apiURL);
-    if (!res.data.status || !res.data.data) throw new Error('No se pudo identificar la canción');
-
+    if (!res.data?.status || !res.data?.data) throw new Error('No se pudo identificar la canción.');
     const { title, artist, album, release } = res.data.data;
-    const ytSearch = await yts(`${title} ${artist}`);
-    const video = ytSearch.videos[0];
-    if (!video) throw new Error("No se encontró la canción en YouTube");
 
-    const banner = `
-╔══════════════════╗
-║ ✦ 𝗔𝘇𝘂𝗿𝗮 𝗨𝗹𝘁𝗿𝗮 𝟮.𝟬 𝗦𝘂𝗯𝗯𝗼𝘁 ✦
+    // Buscar en YouTube
+    const yt = await yts(`${title} ${artist}`);
+    const video = yt?.videos?.[0];
+    if (!video) throw new Error('No se encontró la canción en YouTube.');
+
+    const banner =
+`╔══════════════════╗
+║ ✦ 𝗟𝗮 𝗦𝘂𝗸𝗶 𝗕𝗼𝘁 ✦
 ╚══════════════════╝
 
-🎵 *Canción detectada:*  
-╭───────────────╮  
+🎵 *Canción detectada*
+╭─────────────────╮
 ├ 📌 *Título:* ${title}
 ├ 👤 *Artista:* ${artist}
-├ 💿 *Álbum:* ${album}
-├ 📅 *Lanzamiento:* ${release}
-├ 🔎 *Buscando:* ${video.title}
+├ 💿 *Álbum:* ${album || '-'}
+├ 📅 *Lanzamiento:* ${release || '-'}
+├ 🔎 *Coincidencia:* ${video.title}
 ├ ⏱️ *Duración:* ${video.timestamp}
-├ 👁️ *Vistas:* ${video.views.toLocaleString()}
-├ 📺 *Canal:* ${video.author.name}
+├ 👁️ *Vistas:* ${Number(video.views || 0).toLocaleString()}
+├ 📺 *Canal:* ${video.author?.name || '-'}
 ├ 🔗 *Link:* ${video.url}
-╰───────────────╯
+╰─────────────────╯
 
-⏳ *Espere un momento, descargando la canción...*`;
+⏳ Descargando el audio en 128 kbps…`;
 
-    await conn.sendMessage(msg.key.remoteJid, {
+    await conn.sendMessage(chatId, {
       image: { url: video.thumbnail },
       caption: banner
     }, { quoted: msg });
 
-    const ytRes = await axios.get(`https://api.neoxr.eu/api/youtube?url=${encodeURIComponent(video.url)}&type=audio&quality=128kbps&apikey=russellxz`);
-    const audioURL = ytRes.data.data.url;
+    // Descargar audio de YouTube vía neoxr
+    const yta = await axios.get(
+      `https://api.neoxr.eu/api/youtube?url=${encodeURIComponent(video.url)}&type=audio&quality=128kbps&apikey=${NEOXR_KEY}`,
+      { timeout: 180000 }
+    );
 
-    const rawPath = path.join(tmpDir, `${Date.now()}_raw.m4a`);
-    const finalPath = path.join(tmpDir, `${Date.now()}_final.mp3`);
+    const audioURL = yta?.data?.data?.url;
+    if (!audioURL) throw new Error('No pude obtener el audio desde YouTube.');
 
-    const audioRes = await axios.get(audioURL, { responseType: 'stream' });
-    await streamPipeline(audioRes.data, fs.createWriteStream(rawPath));
+    const rawPath   = path.join(tmpDir, `${Date.now()}_raw.m4a`);
+    const finalPath = path.join(tmpDir, `${slug(title)}.mp3`);
 
+    const audioStream = await axios.get(audioURL, { responseType: 'stream', timeout: 300000 });
+    await streamPipeline(audioStream.data, fs.createWriteStream(rawPath));
+
+    // Convertir a MP3 (libmp3lame, 128k)
     await new Promise((resolve, reject) => {
       ffmpeg(rawPath)
         .audioCodec('libmp3lame')
         .audioBitrate('128k')
+        .format('mp3')
         .save(finalPath)
         .on('end', resolve)
         .on('error', reject);
     });
 
-    await conn.sendMessage(msg.key.remoteJid, {
+    await conn.sendMessage(chatId, {
       audio: fs.readFileSync(finalPath),
       mimetype: 'audio/mpeg',
-      fileName: `${title}.mp3`
+      fileName: path.basename(finalPath),
+      ptt: false
     }, { quoted: msg });
 
-    fs.unlinkSync(inputPath);
-    fs.unlinkSync(rawPath);
-    fs.unlinkSync(finalPath);
+    safeUnlink(inputPath);
+    safeUnlink(rawPath);
+    safeUnlink(finalPath);
 
-    await conn.sendMessage(msg.key.remoteJid, {
-      react: { text: '✅', key: msg.key }
-    });
+    try { await conn.sendMessage(chatId, { react: { text: '✅', key: msg.key } }); } catch {}
 
   } catch (err) {
-    console.error(err);
-    await conn.sendMessage(msg.key.remoteJid, {
-      text: `❌ *Error:* ${err.message}`
-    }, { quoted: msg });
-    await conn.sendMessage(msg.key.remoteJid, {
-      react: { text: '❌', key: msg.key }
-    });
+    console.error('[whatmusic] Error:', err?.message || err);
+    try {
+      await conn.sendMessage(chatId, { text: `❌ *Error:* ${err?.message || 'Fallo desconocido.'}` }, { quoted: msg });
+      await conn.sendMessage(chatId, { react: { text: '❌', key: msg.key } });
+    } catch {}
+  } finally {
+    try {
+      const files = fs.readdirSync(tmpDir);
+      for (const f of files) {
+        if (/_in\.|_raw\.|\.mp3$|\.m4a$/i.test(f)) {
+          safeUnlink(path.join(tmpDir, f));
+        }
+      }
+    } catch {}
   }
 };
 
 handler.command = ['whatmusic'];
+handler.help = ['whatmusic'];
+handler.tags = ['audio', 'tools'];
+handler.register = true;
+
 module.exports = handler;
