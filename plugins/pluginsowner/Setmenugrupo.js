@@ -1,17 +1,58 @@
 // plugins/setmenugrupo.js
 const fs = require("fs");
 const path = require("path");
-const { downloadContentFromMessage } = require("@whiskeysockets/baileys");
 
 const DIGITS = (s = "") => String(s).replace(/\D/g, "");
 
-const handler = async (msg, { conn, args, text }) => {
+/** Desencapsula viewOnce/ephemeral y retorna el nodo interno */
+function unwrapMessage(m) {
+  let node = m;
+  while (
+    node?.viewOnceMessage?.message ||
+    node?.viewOnceMessageV2?.message ||
+    node?.viewOnceMessageV2Extension?.message ||
+    node?.ephemeralMessage?.message
+  ) {
+    node =
+      node.viewOnceMessage?.message ||
+      node.viewOnceMessageV2?.message ||
+      node.viewOnceMessageV2Extension?.message ||
+      node.ephemeralMessage?.message;
+  }
+  return node;
+}
+
+/** Extrae texto del citado (preserva saltos/espacios) */
+function getQuotedText(msg) {
+  const q = msg?.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+  if (!q) return null;
+  const inner = unwrapMessage(q);
+  return inner?.conversation || inner?.extendedTextMessage?.text || null;
+}
+
+/** Extrae imageMessage del citado (soporta ephemeral/viewOnce) */
+function getQuotedImageMessage(msg) {
+  const q = msg?.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+  if (!q) return null;
+  const inner = unwrapMessage(q);
+  return inner?.imageMessage || null;
+}
+
+/** Obtiene wa.downloadContentFromMessage desde donde esté inyectado */
+function ensureWA(wa, conn) {
+  if (wa && typeof wa.downloadContentFromMessage === "function") return wa;
+  if (conn && conn.wa && typeof conn.wa.downloadContentFromMessage === "function") return conn.wa;
+  if (global.wa && typeof global.wa.downloadContentFromMessage === "function") return global.wa;
+  return null;
+}
+
+const handler = async (msg, { conn, args, text, wa }) => {
   const chatId    = msg.key.remoteJid;
   const senderJid = msg.key.participant || msg.key.remoteJid;
   const senderNum = DIGITS(senderJid);
   const fromMe    = !!msg.key.fromMe;
 
-  // 🔐 Permisos globales: solo owners o el bot
+  // 🔐 Permisos: solo owners o el bot
   const isOwner = (typeof global.isOwner === "function")
     ? global.isOwner(senderNum)
     : (Array.isArray(global.owner) && global.owner.some(([id]) => id === senderNum));
@@ -24,16 +65,15 @@ const handler = async (msg, { conn, args, text }) => {
 
   try { await conn.sendMessage(chatId, { react: { text: "🛠️", key: msg.key } }); } catch {}
 
-  // — Texto crudo (conserva saltos/espacios)
+  // — Texto crudo (conserva saltos/espacios). Quita solo 1 espacio inicial tras comando
   const textoArg   = typeof text === "string" ? text : (Array.isArray(args) ? args.join(" ") : "");
   const textoCrudo = textoArg.startsWith(" ") ? textoArg.slice(1) : textoArg;
 
-  // ¿Imagen citada?
-  const ctx = msg.message?.extendedTextMessage?.contextInfo;
-  const quotedImage = ctx?.quotedMessage?.imageMessage;
+  const quotedText  = !textoCrudo ? getQuotedText(msg) : null;
+  const quotedImage = getQuotedImageMessage(msg);
 
-  // Si no hay texto y tampoco hay imagen, pide uso
-  if (!textoCrudo && !quotedImage) {
+  // Si no hay texto ni imagen, muestra uso
+  if (!textoCrudo && !quotedText && !quotedImage) {
     return conn.sendMessage(chatId, {
       text: "✏️ *Uso:*\n• `setmenugrupo <texto>` (multilínea permitido)\n• O responde a una *imagen* y escribe: `setmenugrupo <texto>`"
     }, { quoted: msg });
@@ -43,14 +83,18 @@ const handler = async (msg, { conn, args, text }) => {
   let imagenBase64 = null;
   if (quotedImage) {
     try {
-      const stream = await downloadContentFromMessage(quotedImage, "image");
+      const WA = ensureWA(wa, conn);
+      if (!WA) throw new Error("downloadContentFromMessage no disponible");
+      const stream = await WA.downloadContentFromMessage(quotedImage, "image");
       let buffer = Buffer.alloc(0);
       for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
-      imagenBase64 = buffer.toString("base64");
+      if (buffer.length) imagenBase64 = buffer.toString("base64");
     } catch (e) {
       console.error("[setmenugrupo] error leyendo imagen citada:", e);
     }
   }
+
+  const textoFinal = (textoCrudo || quotedText || "");
 
   // 💾 Guardado GLOBAL en setmenu.json
   const filePath = path.resolve("./setmenu.json");
@@ -61,13 +105,23 @@ const handler = async (msg, { conn, args, text }) => {
     data = {};
   }
 
-  data.texto_grupo  = textoCrudo || data.texto_grupo || ""; // mantiene si no envían texto esta vez
-  if (imagenBase64 !== null) data.imagen_grupo = imagenBase64; // solo sobrescribe si vino imagen
+  // Mantiene el texto anterior si no enviaron texto esta vez
+  data.texto_grupo = textoFinal || data.texto_grupo || "";
+  // Solo sobrescribe imagen si vino una nueva
+  if (imagenBase64 !== null) data.imagen_grupo = imagenBase64;
+
+  data.updatedAt_grupo = Date.now();
 
   fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
 
   try { await conn.sendMessage(chatId, { react: { text: "✅", key: msg.key } }); } catch {}
-  return conn.sendMessage(chatId, { text: "✅ *C-Menu Grupo (global) actualizado.*" }, { quoted: msg });
+  return conn.sendMessage(chatId, {
+    text: `✅ *C-Menu Grupo (global) actualizado.*\n${
+      textoFinal ? "• Texto: guardado" : "• Texto: (sin cambios)"
+    }\n${
+      imagenBase64 ? "• Imagen: guardada" : "• Imagen: (sin cambios)"
+    }`
+  }, { quoted: msg });
 };
 
 handler.command = ["setmenugrupo"];
