@@ -155,4 +155,4 @@ const handler = async (m, { conn }) => {
 
 handler.customPrefix = /^\.?(menu|menuall)$/i;
 handler.command = new RegExp;
-export default handler;
+module.exports = handler;
